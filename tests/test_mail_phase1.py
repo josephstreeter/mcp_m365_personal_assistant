@@ -285,7 +285,9 @@ def test_forward_message_helper_handles_forward_error():
     )
 
     assert "error" in result
-    assert "failed to forward" in result["error"].lower()
+    assert "graph api error" in result["error"].lower()
+    assert result.get("error_type") == "GraphAPIError"
+
 
 
 def test_mark_message_read_helper_updates_message():

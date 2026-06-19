@@ -10,4 +10,5 @@ dependencies = [
     "fastmcp>=3.1.0",
     "microsoft-kiota-abstractions>=1.9.9",
     "msgraph-sdk>=1.55.0",
+    "pydantic>=2.0,<3.0",
 ]

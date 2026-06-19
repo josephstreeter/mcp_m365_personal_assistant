@@ -3,11 +3,23 @@ Personal productivity functions for Microsoft 365 (M365) integration.
 Handles user profile, email, calendar, tasks, contacts, files, Teams, and insights.
 """
 
+import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 from kiota_abstractions.base_request_configuration import RequestConfiguration
+from modules.errors import (
+    M365Exception,
+    GraphAPIError,
+    ValidationError,
+    AuthenticationError,
+    TimeoutError as M365TimeoutError,
+    error_from_graph_exception,
+)
+from modules.cache import TTLCache
+from modules.enums import ContentType, TodoStatus, EventResponse
+from modules.logging_utils import log_event
 from msgraph.graph_service_client import GraphServiceClient
 from msgraph.generated.models.todo_task import TodoTask
 from msgraph.generated.models.todo_task_list import TodoTaskList
@@ -56,6 +68,50 @@ from msgraph.generated.drives.item.items.item.create_link.create_link_post_reque
 
 logger = logging.getLogger(__name__)
 
+GRAPH_CALL_TIMEOUT_SECONDS = 30
+READ_CACHE_TTL_SECONDS = 300
+_read_cache = TTLCache(default_ttl_seconds=READ_CACHE_TTL_SECONDS)
+
+
+async def _graph_call(awaitable, operation: str):
+    """Run a Graph SDK awaitable with a consistent timeout."""
+    try:
+        log_event(logger, logging.DEBUG, "graph_call_start", f"Starting Graph call: {operation}", operation=operation)
+        result = await asyncio.wait_for(awaitable, timeout=GRAPH_CALL_TIMEOUT_SECONDS)
+        log_event(logger, logging.DEBUG, "graph_call_success", f"Completed Graph call: {operation}", operation=operation)
+        return result
+    except asyncio.TimeoutError as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "graph_call_timeout",
+            f"Graph call timed out: {operation}",
+            operation=operation,
+            timeout_seconds=GRAPH_CALL_TIMEOUT_SECONDS,
+        )
+        raise M365TimeoutError(
+            f"{operation} timed out after {GRAPH_CALL_TIMEOUT_SECONDS} seconds"
+        ) from exc
+
+
+def _cache_get(key: str):
+    value = _read_cache.get(key)
+    if value is None:
+        log_event(logger, logging.DEBUG, "cache_miss", "Cache miss", key=key)
+    else:
+        log_event(logger, logging.DEBUG, "cache_hit", "Cache hit", key=key)
+    return value
+
+
+def _cache_set(key: str, value):
+    log_event(logger, logging.DEBUG, "cache_set", "Cache set", key=key, ttl_seconds=READ_CACHE_TTL_SECONDS)
+    return _read_cache.set(key, value)
+
+
+def _cache_invalidate(prefix: str):
+    log_event(logger, logging.DEBUG, "cache_invalidate", "Cache invalidation by prefix", prefix=prefix)
+    _read_cache.invalidate_prefix(prefix)
+
 
 # User Profile
 
@@ -70,18 +126,29 @@ async def get_user_profile(client: GraphServiceClient) -> dict:
         dict: User profile information or error message
     """
     try:
-        profile = await client.me.get()
+        cache_key = "read:user_profile"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        profile = await _graph_call(client.me.get(), "Get user profile")
         if profile:
-            return {
+            result = {
                 "display_name": profile.display_name,
                 "email": profile.mail,
                 "job_title": profile.job_title,
                 "id": profile.id,
             }
+            return _cache_set(cache_key, result)
         return {"error": "Could not retrieve user profile."}
+    except asyncio.TimeoutError:
+        exc = M365TimeoutError("User profile request timed out after 30 seconds")
+        logger.warning(f"Graph API timeout: {exc.message}")
+        return exc.to_dict()
     except Exception as e:
-        logger.error(f"Failed to get user profile: {e}")
-        return {"error": f"Failed to get user profile: {str(e)}"}
+        exc = error_from_graph_exception(e)
+        logger.error(f"Failed to get user profile: {exc.message}")
+        return exc.to_dict()
 
 
 # Microsoft To Do
@@ -98,13 +165,13 @@ async def get_todo_tasks(client: GraphServiceClient) -> list[dict]:
     """
     try:
         results = []
-        task_lists = await client.me.todo.lists.get()
+        task_lists = await _graph_call(client.me.todo.lists.get(), "Graph API call")
         if task_lists and task_lists.value:
             for task_list in task_lists.value:
                 list_name = task_list.display_name
                 if not task_list.id:
                     continue
-                tasks = await client.me.todo.lists.by_todo_task_list_id(task_list.id).tasks.get()
+                tasks = await _graph_call(client.me.todo.lists.by_todo_task_list_id(task_list.id).tasks.get(), "Graph API call")
                 if tasks and tasks.value:
                     for task in tasks.value:
                         results.append({
@@ -130,7 +197,12 @@ async def get_todo_lists(client: GraphServiceClient) -> dict:
         dict: To Do lists payload or error
     """
     try:
-        task_lists = await client.me.todo.lists.get()
+        cache_key = "read:todo_lists"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        task_lists = await _graph_call(client.me.todo.lists.get(), "Graph API call")
         lists = []
         if task_lists and task_lists.value:
             for task_list in task_lists.value:
@@ -143,9 +215,15 @@ async def get_todo_lists(client: GraphServiceClient) -> dict:
                     }
                 )
 
-        return {"lists": lists}
+        return _cache_set(cache_key, {"lists": lists})
     except Exception as e:
-        logger.error(f"Failed to get todo lists: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "todo_lists_fetch_failed",
+            "Failed to get todo lists",
+            error=str(e),
+        )
         return {"error": f"Failed to get todo lists: {str(e)}"}
 
 
@@ -163,7 +241,7 @@ async def create_todo_task(client: GraphServiceClient, list_name: str, title: st
         dict: Created task information or error message
     """
     try:
-        task_lists = await client.me.todo.lists.get()
+        task_lists = await _graph_call(client.me.todo.lists.get(), "Graph API call")
         target_list = None
         if task_lists and task_lists.value:
             for tl in task_lists.value:
@@ -182,8 +260,9 @@ async def create_todo_task(client: GraphServiceClient, list_name: str, title: st
             due.time_zone = "UTC"
             new_task.due_date_time = due
 
-        created = await client.me.todo.lists.by_todo_task_list_id(target_list.id).tasks.post(new_task)
+        created = await _graph_call(client.me.todo.lists.by_todo_task_list_id(target_list.id).tasks.post(new_task), "Graph API call")
         if created:
+            _cache_invalidate("read:todo")
             return {
                 "id": created.id,
                 "title": created.title,
@@ -208,7 +287,7 @@ async def complete_todo_task(client: GraphServiceClient, list_name: str, task_ti
         dict: Updated task information or error message
     """
     try:
-        task_lists = await client.me.todo.lists.get()
+        task_lists = await _graph_call(client.me.todo.lists.get(), "Graph API call")
         target_list = None
         if task_lists and task_lists.value:
             for tl in task_lists.value:
@@ -219,7 +298,7 @@ async def complete_todo_task(client: GraphServiceClient, list_name: str, task_ti
         if not target_list or not target_list.id:
             return {"error": f"Task list '{list_name}' not found."}
 
-        tasks = await client.me.todo.lists.by_todo_task_list_id(target_list.id).tasks.get()
+        tasks = await _graph_call(client.me.todo.lists.by_todo_task_list_id(target_list.id).tasks.get(), "Graph API call")
         target_task = None
         if tasks and tasks.value:
             for t in tasks.value:
@@ -232,8 +311,9 @@ async def complete_todo_task(client: GraphServiceClient, list_name: str, task_ti
 
         update = TodoTask()
         update.status = TaskStatus.Completed
-        updated = await client.me.todo.lists.by_todo_task_list_id(target_list.id).tasks.by_todo_task_id(target_task.id).patch(update)
+        updated = await _graph_call(client.me.todo.lists.by_todo_task_list_id(target_list.id).tasks.by_todo_task_id(target_task.id).patch(update), "Graph API call")
         if updated:
+            _cache_invalidate("read:todo")
             return {"title": updated.title, "status": updated.status.value if updated.status else "unknown"}
         return {"error": "Failed to update task."}
     except Exception as e:
@@ -275,18 +355,19 @@ async def update_todo_task(
             update.due_date_time = due
         if status is not None:
             status_map = {
-                "notStarted": TaskStatus.NotStarted,
-                "inProgress": TaskStatus.InProgress,
-                "completed": TaskStatus.Completed,
-                "waitingOnOthers": TaskStatus.WaitingOnOthers,
-                "deferred": TaskStatus.Deferred,
+                TodoStatus.NOT_STARTED.value: TaskStatus.NotStarted,
+                TodoStatus.IN_PROGRESS.value: TaskStatus.InProgress,
+                TodoStatus.COMPLETED.value: TaskStatus.Completed,
+                TodoStatus.WAITING_ON_OTHERS.value: TaskStatus.WaitingOnOthers,
+                TodoStatus.DEFERRED.value: TaskStatus.Deferred,
             }
             mapped = status_map.get(status)
             if mapped is None:
                 return {"error": "Invalid status. Use one of: notStarted, inProgress, completed, waitingOnOthers, deferred."}
             update.status = mapped
 
-        updated = await client.me.todo.lists.by_todo_task_list_id(list_id).tasks.by_todo_task_id(task_id).patch(update)
+        updated = await _graph_call(client.me.todo.lists.by_todo_task_list_id(list_id).tasks.by_todo_task_id(task_id).patch(update), "Graph API call")
+        _cache_invalidate("read:todo")
         return {
             "status": "updated",
             "list_id": list_id,
@@ -310,7 +391,8 @@ async def delete_todo_task(client: GraphServiceClient, list_id: str, task_id: st
         dict: Delete status or error
     """
     try:
-        await client.me.todo.lists.by_todo_task_list_id(list_id).tasks.by_todo_task_id(task_id).delete()
+        await _graph_call(client.me.todo.lists.by_todo_task_list_id(list_id).tasks.by_todo_task_id(task_id).delete(), "Graph API call")
+        _cache_invalidate("read:todo")
         return {
             "status": "deleted",
             "list_id": list_id,
@@ -336,9 +418,11 @@ async def create_todo_list(client: GraphServiceClient, display_name: str) -> dic
         todo_list = TodoTaskList()
         todo_list.display_name = display_name
 
-        created = await client.me.todo.lists.post(todo_list)
+        created = await _graph_call(client.me.todo.lists.post(todo_list), "Graph API call")
         if not created:
             return {"error": "Failed to create todo list."}
+
+        _cache_invalidate("read:todo")
 
         return {
             "status": "created",
@@ -377,9 +461,9 @@ async def get_messages(client: GraphServiceClient, top: int = 25, mailbox: str |
         )
         # Use shared mailbox if specified, otherwise use authenticated user's mailbox
         if mailbox:
-            messages = await client.users.by_user_id(mailbox).messages.get(request_configuration=request_config)
+            messages = await _graph_call(client.users.by_user_id(mailbox).messages.get(request_configuration=request_config), "Graph API call")
         else:
-            messages = await client.me.messages.get(request_configuration=request_config)
+            messages = await _graph_call(client.me.messages.get(request_configuration=request_config), "Graph API call")
         results = []
         if messages and messages.value:
             for msg in messages.value:
@@ -416,7 +500,7 @@ async def send_message(client: GraphServiceClient, to: str, subject: str, body: 
         msg.subject = subject
         
         # Set content type based on parameter
-        body_type = BodyType.Html if content_type.lower() == "html" else BodyType.Text
+        body_type = BodyType.Html if content_type.lower() == ContentType.HTML.value else BodyType.Text
         msg.body = ItemBody(content=body, content_type=body_type)
         
         recipient = Recipient(email_address=EmailAddress(address=to))
@@ -429,10 +513,18 @@ async def send_message(client: GraphServiceClient, to: str, subject: str, body: 
         request_body = SendMailPostRequestBody()
         request_body.message = msg
         request_body.save_to_sent_items = True
-        await client.me.send_mail.post(request_body)
+        await _graph_call(client.me.send_mail.post(request_body), "Graph API call")
         return {"status": "sent", "to": to, "subject": subject, "content_type": content_type, "from": from_address or "authenticated user"}
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "mail_send_failed",
+            "Failed to send message",
+            to=to,
+            subject=subject,
+            error=str(e),
+        )
         return {"error": f"Failed to send message: {str(e)}"}
 
 
@@ -460,9 +552,9 @@ async def search_messages(client: GraphServiceClient, query: str, top: int = 25,
         )
         # Use shared mailbox if specified, otherwise use authenticated user's mailbox
         if mailbox:
-            messages = await client.users.by_user_id(mailbox).messages.get(request_configuration=request_config)
+            messages = await _graph_call(client.users.by_user_id(mailbox).messages.get(request_configuration=request_config), "Graph API call")
         else:
-            messages = await client.me.messages.get(request_configuration=request_config)
+            messages = await _graph_call(client.me.messages.get(request_configuration=request_config), "Graph API call")
         results = []
         if messages and messages.value:
             for msg in messages.value:
@@ -501,15 +593,15 @@ async def get_message_by_id(client: GraphServiceClient, message_id: str, mailbox
             query_parameters=query_params,
         )
         if mailbox:
-            msg = await client.users.by_user_id(mailbox).messages.by_message_id(message_id).get(request_configuration=request_config)
+            msg = await _graph_call(client.users.by_user_id(mailbox).messages.by_message_id(message_id).get(request_configuration=request_config), "Graph API call")
         else:
-            msg = await client.me.messages.by_message_id(message_id).get(request_configuration=request_config)
+            msg = await _graph_call(client.me.messages.by_message_id(message_id).get(request_configuration=request_config), "Graph API call")
 
         if not msg:
             return {"error": "Message not found."}
 
         # Extract body type and content
-        body_type = "html" if msg.body and msg.body.content_type == BodyType.Html else "text"
+        body_type = ContentType.HTML.value if msg.body and msg.body.content_type == BodyType.Html else ContentType.TEXT.value
         body_content = msg.body.content if msg.body else ""
 
         # Extract recipient email addresses
@@ -573,8 +665,9 @@ async def reply_to_message(
         dict: Send status or error
     """
     try:
-        if not body.strip():
-            return {"error": "Reply body cannot be empty."}
+        if not body or not body.strip():
+            exc = ValidationError("Reply body cannot be empty.")
+            return exc.to_dict()
 
         target = (
             client.users.by_user_id(mailbox).messages.by_message_id(message_id)
@@ -586,11 +679,11 @@ async def reply_to_message(
         if reply_all:
             request_body = ReplyAllPostRequestBody()
             request_body.comment = body
-            await target.reply_all.post(request_body)
+            await _graph_call(target.reply_all.post(request_body), "Reply all to message")
         else:
             request_body = ReplyPostRequestBody()
             request_body.comment = body
-            await target.reply.post(request_body)
+            await _graph_call(target.reply.post(request_body), "Reply to message")
 
         return {
             "status": "sent",
@@ -599,48 +692,14 @@ async def reply_to_message(
             "mailbox": mailbox,
             "content_type": content_type,
         }
+    except asyncio.TimeoutError:
+        exc = M365TimeoutError("Reply operation timed out after 30 seconds")
+        logger.warning(f"Graph API timeout: {exc.message}")
+        return exc.to_dict()
     except Exception as e:
-        logger.error(f"Failed to reply to message: {e}")
-        return {"error": f"Failed to reply to message: {str(e)}"}
-
-
-async def reply_to_message(
-    client: GraphServiceClient,
-    message_id: str,
-    body: str,
-    content_type: str = "text",
-    reply_all: bool = False,
-    mailbox: str | None = None,
-) -> dict:
-    """
-    Reply to a message.
-
-    Args:
-        client: Authenticated Graph API client
-        message_id: Message ID to reply to
-        body: Reply body text
-        content_type: text or html
-        reply_all: Reply to all or just sender
-        mailbox: Optional mailbox identifier
-
-    Returns:
-        dict: Send status or error
-    """
-    try:
-        body_type = BodyType.Html if content_type.lower() == "html" else BodyType.Text
-        req_body = ReplyPostRequestBody()
-        req_body.comment = body
-
-        await client.me.messages.by_message_id(message_id).reply.post(req_body)
-        return {
-            "status": "sent",
-            "message_id": message_id,
-            "reply_all": reply_all,
-            "mailbox": mailbox,
-        }
-    except Exception as e:
-        logger.error(f"Failed to reply to message: {e}")
-        return {"error": f"Failed to reply to message: {str(e)}"}
+        exc = error_from_graph_exception(e)
+        logger.error(f"Failed to reply to message: {exc.message}")
+        return exc.to_dict()
 
 
 async def forward_message(
@@ -675,58 +734,24 @@ async def forward_message(
         if comment:
             req_body.comment = comment
 
-        await client.me.messages.by_message_id(message_id).forward.post(req_body)
+        await asyncio.wait_for(
+            client.me.messages.by_message_id(message_id).forward.post(req_body),
+            timeout=30
+        )
         return {
             "status": "sent",
             "message_id": message_id,
             "to": to,
             "mailbox": mailbox,
         }
+    except asyncio.TimeoutError:
+        exc = M365TimeoutError("Forward operation timed out after 30 seconds")
+        logger.warning(f"Graph API timeout: {exc.message}")
+        return exc.to_dict()
     except Exception as e:
-        logger.error(f"Failed to forward message: {e}")
-        return {"error": f"Failed to forward message: {str(e)}"}
-
-
-async def reply_to_message(
-    client: GraphServiceClient,
-    message_id: str,
-    body: str,
-    content_type: str = "text",
-    reply_all: bool = False,
-    mailbox: str | None = None,
-) -> dict:
-    """
-    Reply to an existing message.
-
-    Args:
-        client: Authenticated Graph API client
-        message_id: Message ID to reply to
-        body: Reply body text
-        content_type: text or html
-        reply_all: Reply to all or just sender
-        mailbox: Optional mailbox identifier
-
-    Returns:
-        dict: Reply status or error
-    """
-    try:
-        if not body or not body.strip():
-            return {"error": "Reply body cannot be empty."}
-        
-        body_type = BodyType.Html if content_type.lower() == "html" else BodyType.Text
-        req_body = ReplyPostRequestBody()
-        req_body.comment = body
-
-        await client.me.messages.by_message_id(message_id).reply.post(req_body)
-        return {
-            "status": "sent",
-            "message_id": message_id,
-            "reply_all": reply_all,
-            "mailbox": mailbox,
-        }
-    except Exception as e:
-        logger.error(f"Failed to reply to message: {e}")
-        return {"error": f"Failed to reply to message: {str(e)}"}
+        exc = error_from_graph_exception(e)
+        logger.error(f"Failed to forward message: {exc.message}")
+        return exc.to_dict()
 
 
 async def mark_message_read(
@@ -756,7 +781,7 @@ async def mark_message_read(
 
         update = Message()
         update.is_read = is_read
-        updated = await target.patch(update)
+        updated = await _graph_call(target.patch(update), "Graph API call")
 
         return {
             "status": "updated",
@@ -796,9 +821,9 @@ async def list_mail_folders(
         )
 
         folders = (
-            await client.users.by_user_id(mailbox).mail_folders.get(request_configuration=request_config)
+            await _graph_call(client.users.by_user_id(mailbox).mail_folders.get(request_configuration=request_config), "Graph API call")
             if mailbox
-            else await client.me.mail_folders.get(request_configuration=request_config)
+            else await _graph_call(client.me.mail_folders.get(request_configuration=request_config), "Graph API call")
         )
 
         results = []
@@ -843,7 +868,7 @@ async def move_message(
 
         request_body = MovePostRequestBody()
         request_body.destination_id = destination_folder_id
-        moved = await target.move.post(request_body)
+        moved = await _graph_call(target.move.post(request_body), "Graph API call")
 
         return {
             "status": "moved",
@@ -883,12 +908,18 @@ async def get_message_attachments(
         )
 
         attachments = (
-            await client.users.by_user_id(mailbox).messages.by_message_id(message_id).attachments.get(
-                request_configuration=request_config,
+            await _graph_call(
+                client.users.by_user_id(mailbox).messages.by_message_id(message_id).attachments.get(
+                    request_configuration=request_config,
+                ),
+                "Get message attachments from mailbox",
             )
             if mailbox
-            else await client.me.messages.by_message_id(message_id).attachments.get(
-                request_configuration=request_config,
+            else await _graph_call(
+                client.me.messages.by_message_id(message_id).attachments.get(
+                    request_configuration=request_config,
+                ),
+                "Get message attachments",
             )
         )
 
@@ -928,6 +959,11 @@ async def get_calendar_events(client: GraphServiceClient, days: int = 7) -> list
         list[dict]: List of calendar events or empty list on error
     """
     try:
+        cache_key = f"read:calendar_events:{days}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         now = datetime.now(timezone.utc)
         start = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         end = (now + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -942,7 +978,7 @@ async def get_calendar_events(client: GraphServiceClient, days: int = 7) -> list
         request_config = RequestConfiguration[CalendarViewRequestBuilder.CalendarViewRequestBuilderGetQueryParameters](
             query_parameters=query_params,
         )
-        events = await client.me.calendar_view.get(request_configuration=request_config)
+        events = await _graph_call(client.me.calendar_view.get(request_configuration=request_config), "Graph API call")
         results = []
         if events and events.value:
             for event in events.value:
@@ -954,7 +990,7 @@ async def get_calendar_events(client: GraphServiceClient, days: int = 7) -> list
                     "location": event.location.display_name if event.location and event.location.display_name else None,
                     "organizer": event.organizer.email_address.name if event.organizer and event.organizer.email_address else "Unknown",
                 })
-        return results
+        return _cache_set(cache_key, results)
     except Exception as e:
         logger.error(f"Failed to get calendar events: {e}")
         return [{"error": f"Failed to get calendar events: {str(e)}"}]
@@ -1006,8 +1042,9 @@ async def create_calendar_event(
                 for a in attendees
             ]
 
-        created = await client.me.events.post(event)
+        created = await _graph_call(client.me.events.post(event), "Graph API call")
         if created:
+            _cache_invalidate("read:calendar_events")
             return {
                 "id": created.id,
                 "subject": created.subject,
@@ -1016,7 +1053,16 @@ async def create_calendar_event(
             }
         return {"error": "Failed to create event."}
     except Exception as e:
-        logger.error(f"Failed to create calendar event: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "calendar_event_create_failed",
+            "Failed to create calendar event",
+            subject=subject,
+            start=start,
+            end=end,
+            error=str(e),
+        )
         return {"error": f"Failed to create event: {str(e)}"}
 
 
@@ -1072,7 +1118,8 @@ async def update_calendar_event(
         if is_all_day is not None:
             update.is_all_day = is_all_day
 
-        updated = await client.me.events.by_event_id(event_id).patch(update)
+        updated = await _graph_call(client.me.events.by_event_id(event_id).patch(update), "Graph API call")
+        _cache_invalidate("read:calendar_events")
 
         return {
             "status": "updated",
@@ -1082,7 +1129,14 @@ async def update_calendar_event(
             "end": updated.end.date_time if updated and updated.end else end,
         }
     except Exception as e:
-        logger.error(f"Failed to update calendar event: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "calendar_event_update_failed",
+            "Failed to update calendar event",
+            event_id=event_id,
+            error=str(e),
+        )
         return {"error": f"Failed to update calendar event: {str(e)}"}
 
 
@@ -1098,7 +1152,8 @@ async def delete_calendar_event(client: GraphServiceClient, event_id: str) -> di
         dict: Delete status or error
     """
     try:
-        await client.me.events.by_event_id(event_id).delete()
+        await _graph_call(client.me.events.by_event_id(event_id).delete(), "Graph API call")
+        _cache_invalidate("read:calendar_events")
         return {
             "status": "deleted",
             "event_id": event_id,
@@ -1132,24 +1187,25 @@ async def respond_to_event(
         normalized = response.strip().lower()
         target = client.me.events.by_event_id(event_id)
 
-        if normalized == "accept":
+        if normalized == EventResponse.ACCEPT.value:
             request_body = AcceptPostRequestBody()
             request_body.comment = comment
             request_body.send_response = send_response
-            await target.accept.post(request_body)
-        elif normalized == "decline":
+            await _graph_call(target.accept.post(request_body), "Graph API call")
+        elif normalized == EventResponse.DECLINE.value:
             request_body = DeclinePostRequestBody()
             request_body.comment = comment
             request_body.send_response = send_response
-            await target.decline.post(request_body)
-        elif normalized == "tentative":
+            await _graph_call(target.decline.post(request_body), "Graph API call")
+        elif normalized == EventResponse.TENTATIVE.value:
             request_body = TentativelyAcceptPostRequestBody()
             request_body.comment = comment
             request_body.send_response = send_response
-            await target.tentatively_accept.post(request_body)
+            await _graph_call(target.tentatively_accept.post(request_body), "Graph API call")
         else:
             return {"error": "Invalid response. Use one of: accept, decline, tentative."}
 
+        _cache_invalidate("read:calendar_events")
         return {
             "status": "responded",
             "event_id": event_id,
@@ -1157,7 +1213,15 @@ async def respond_to_event(
             "send_response": send_response,
         }
     except Exception as e:
-        logger.error(f"Failed to respond to event: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "calendar_event_response_failed",
+            "Failed to respond to event",
+            event_id=event_id,
+            response=response,
+            error=str(e),
+        )
         return {"error": f"Failed to respond to event: {str(e)}"}
 
 
@@ -1195,7 +1259,7 @@ async def find_meeting_times(
         request_body.end_time = DateTimeTimeZone(date_time=time_window_end, time_zone="UTC")
         request_body.availability_view_interval = max(5, min(duration_minutes, 1440))
 
-        schedule_response = await client.me.calendar.get_schedule.post(request_body)
+        schedule_response = await _graph_call(client.me.calendar.get_schedule.post(request_body), "Graph API call")
         schedule_infos = schedule_response.value if schedule_response and schedule_response.value else []
 
         suggestions = []
@@ -1241,6 +1305,11 @@ async def get_contacts(client: GraphServiceClient, top: int = 25) -> list[dict]:
         list[dict]: List of contacts or empty list on error
     """
     try:
+        cache_key = f"read:contacts:{top}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         query_params = ContactsRequestBuilder.ContactsRequestBuilderGetQueryParameters(
             select=["displayName", "emailAddresses", "mobilePhone", "businessPhones", "companyName", "jobTitle"],
             top=top,
@@ -1248,7 +1317,7 @@ async def get_contacts(client: GraphServiceClient, top: int = 25) -> list[dict]:
         request_config = RequestConfiguration[ContactsRequestBuilder.ContactsRequestBuilderGetQueryParameters](
             query_parameters=query_params,
         )
-        contacts = await client.me.contacts.get(request_configuration=request_config)
+        contacts = await _graph_call(client.me.contacts.get(request_configuration=request_config), "Graph API call")
         results = []
         if contacts and contacts.value:
             for c in contacts.value:
@@ -1261,7 +1330,7 @@ async def get_contacts(client: GraphServiceClient, top: int = 25) -> list[dict]:
                     "company": c.company_name,
                     "job_title": c.job_title,
                 })
-        return results
+        return _cache_set(cache_key, results)
     except Exception as e:
         logger.error(f"Failed to get contacts: {e}")
         return [{"error": f"Failed to get contacts: {str(e)}"}]
@@ -1281,12 +1350,17 @@ async def get_recent_files(client: GraphServiceClient, top: int = 25) -> list[di
         list[dict]: List of recent files or empty list on error
     """
     try:
-        drive = await client.me.drive.get()
+        cache_key = f"read:recent_files:{top}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        drive = await _graph_call(client.me.drive.get(), "Graph API call")
         if not drive or not drive.id:
             return [{"error": "Could not access user's drive."}]
 
         children_builder = getattr(client.drives.by_drive_id(drive.id).root, "children")
-        children_resp = await children_builder.get()
+        children_resp = await _graph_call(children_builder.get(), "Graph API call")
         items = children_resp.value if children_resp and children_resp.value else []
 
         # Sort by last_modified_date_time (newest first), tolerating None values
@@ -1300,9 +1374,16 @@ async def get_recent_files(client: GraphServiceClient, top: int = 25) -> list[di
                 "size": item.size,
                 "last_modified": str(item.last_modified_date_time) if item.last_modified_date_time else None,
             })
-        return results
+        return _cache_set(cache_key, results)
     except Exception as e:
-        logger.error(f"Failed to get recent files: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "recent_files_fetch_failed",
+            "Failed to get recent files",
+            top=top,
+            error=str(e),
+        )
         return [{"error": f"Failed to get recent files: {str(e)}"}]
 
 
@@ -1319,11 +1400,11 @@ async def search_files(client: GraphServiceClient, query: str, top: int = 25) ->
         list[dict]: List of matching files or empty list on error
     """
     try:
-        drive = await client.me.drive.get()
+        drive = await _graph_call(client.me.drive.get(), "Graph API call")
         if not drive or not drive.id:
             return [{"error": "Could not access user's drive."}]
 
-        search_results = await client.drives.by_drive_id(drive.id).search_with_q(q=query).get()
+        search_results = await _graph_call(client.drives.by_drive_id(drive.id).search_with_q(q=query).get(), "Graph API call")
         results = []
         if search_results and search_results.value:
             for item in search_results.value[:top]:
@@ -1352,7 +1433,7 @@ async def list_drive_items(client: GraphServiceClient, item_id: str | None = Non
         dict: Folder listing payload or error
     """
     try:
-        drive = await client.me.drive.get()
+        drive = await _graph_call(client.me.drive.get(), "Graph API call")
         if not drive or not drive.id:
             return {"error": "Could not access user's drive."}
 
@@ -1366,12 +1447,18 @@ async def list_drive_items(client: GraphServiceClient, item_id: str | None = Non
         )
 
         if item_id:
-            children = await client.drives.by_drive_id(drive.id).items.by_drive_item_id(item_id).children.get(
-                request_configuration=request_config,
+            children = await _graph_call(
+                client.drives.by_drive_id(drive.id).items.by_drive_item_id(item_id).children.get(
+                    request_configuration=request_config,
+                ),
+                "List drive children by item",
             )
         else:
-            children = await client.drives.by_drive_id(drive.id).root.children.get(
-                request_configuration=request_config,
+            children = await _graph_call(
+                client.drives.by_drive_id(drive.id).root.children.get(
+                    request_configuration=request_config,
+                ),
+                "List drive root children",
             )
 
         items = []
@@ -1414,7 +1501,7 @@ async def create_share_link(
         dict: Share-link metadata or error
     """
     try:
-        drive = await client.me.drive.get()
+        drive = await _graph_call(client.me.drive.get(), "Graph API call")
         if not drive or not drive.id:
             return {"error": "Could not access user's drive."}
 
@@ -1422,7 +1509,7 @@ async def create_share_link(
         request_body.type = link_type
         request_body.scope = scope
 
-        permission = await client.drives.by_drive_id(drive.id).items.by_drive_item_id(item_id).create_link.post(request_body)
+        permission = await _graph_call(client.drives.by_drive_id(drive.id).items.by_drive_item_id(item_id).create_link.post(request_body), "Graph API call")
         web_url = permission.link.web_url if permission and permission.link else None
 
         return {
@@ -1458,7 +1545,7 @@ async def upload_small_text_file(
         dict: Uploaded file metadata or error
     """
     try:
-        drive = await client.me.drive.get()
+        drive = await _graph_call(client.me.drive.get(), "Graph API call")
         if not drive or not drive.id:
             return {"error": "Could not access user's drive."}
 
@@ -1469,16 +1556,20 @@ async def upload_small_text_file(
         new_file.file = File()
 
         if parent_item_id:
-            created = await drive_builder.items.by_drive_item_id(parent_item_id).children.post(new_file)
+            created = await _graph_call(drive_builder.items.by_drive_item_id(parent_item_id).children.post(new_file), "Graph API call")
         else:
-            created = await drive_builder.root.children.post(new_file)
+            created = await _graph_call(drive_builder.root.children.post(new_file), "Graph API call")
 
         if not created or not created.id:
             return {"error": "Failed to create file item in OneDrive."}
 
-        uploaded = await drive_builder.items.by_drive_item_id(created.id).content.put(content.encode("utf-8"))
+        uploaded = await _graph_call(
+            drive_builder.items.by_drive_item_id(created.id).content.put(content.encode("utf-8")),
+            "Upload file content",
+        )
         item = uploaded or created
 
+        _cache_invalidate("read:recent_files")
         return {
             "status": "uploaded",
             "item": {
@@ -1515,7 +1606,7 @@ async def get_teams_chats(client: GraphServiceClient, top: int = 25) -> list[dic
         request_config = RequestConfiguration[ChatsRequestBuilder.ChatsRequestBuilderGetQueryParameters](
             query_parameters=query_params,
         )
-        chats = await client.me.chats.get(request_configuration=request_config)
+        chats = await _graph_call(client.me.chats.get(request_configuration=request_config), "Graph API call")
         results = []
         if chats and chats.value:
             for chat in chats.value:
@@ -1550,7 +1641,7 @@ async def get_chat_messages(client: GraphServiceClient, chat_id: str, top: int =
         request_config = RequestConfiguration[ChatMessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters](
             query_parameters=query_params,
         )
-        messages = await client.me.chats.by_chat_id(chat_id).messages.get(request_configuration=request_config)
+        messages = await _graph_call(client.me.chats.by_chat_id(chat_id).messages.get(request_configuration=request_config), "Graph API call")
         results = []
         if messages and messages.value:
             for msg in messages.value:
@@ -1578,7 +1669,7 @@ async def get_chat_participants(client: GraphServiceClient, chat_id: str) -> dic
         dict: Participant payload or error
     """
     try:
-        members = await client.me.chats.by_chat_id(chat_id).members.get()
+        members = await _graph_call(client.me.chats.by_chat_id(chat_id).members.get(), "Graph API call")
         participants = []
         if members and members.value:
             for member in members.value:
@@ -1631,7 +1722,7 @@ async def send_chat_message(client: GraphServiceClient, message: str, recipient:
         else:
             # Create or get 1:1 chat with recipient
             assert recipient is not None  # guaranteed by the guard above
-            me = await client.me.get()
+            me = await _graph_call(client.me.get(), "Graph API call")
             if not me or not me.id:
                 return {"error": "Failed to get authenticated user information"}
             
@@ -1665,7 +1756,7 @@ async def send_chat_message(client: GraphServiceClient, message: str, recipient:
             
             chat.members = members
             
-            created_chat = await client.chats.post(chat)
+            created_chat = await _graph_call(client.chats.post(chat), "Graph API call")
             
             if not created_chat or not created_chat.id:
                 return {"error": "Failed to create or retrieve chat"}
@@ -1674,14 +1765,15 @@ async def send_chat_message(client: GraphServiceClient, message: str, recipient:
             target = recipient
         
         # Send message to the chat
-        body_type = BodyType.Html if content_type.lower() == "html" else BodyType.Text
+        body_type = BodyType.Html if content_type.lower() == ContentType.HTML.value else BodyType.Text
         chat_message = ChatMessage()
         chat_message.body = ItemBody(
             content_type=body_type,
             content=message
         )
         
-        await client.chats.by_chat_id(target_chat_id).messages.post(chat_message)
+        await _graph_call(client.chats.by_chat_id(target_chat_id).messages.post(chat_message), "Graph API call")
+        _cache_invalidate("read:relevant_people")
         
         return {
             "status": "sent",
@@ -1690,7 +1782,15 @@ async def send_chat_message(client: GraphServiceClient, message: str, recipient:
             "content_type": content_type
         }
     except Exception as e:
-        logger.error(f"Failed to send chat message: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "chat_message_send_failed",
+            "Failed to send chat message",
+            recipient=recipient,
+            chat_id=chat_id,
+            error=str(e),
+        )
         return {"error": f"Failed to send chat message: {str(e)}"}
 
 
@@ -1715,14 +1815,15 @@ async def send_channel_message(
         dict: Send status or error
     """
     try:
-        body_type = BodyType.Html if content_type.lower() == "html" else BodyType.Text
+        body_type = BodyType.Html if content_type.lower() == ContentType.HTML.value else BodyType.Text
         chat_message = ChatMessage()
         chat_message.body = ItemBody(
             content_type=body_type,
             content=message,
         )
 
-        created = await client.teams.by_team_id(team_id).channels.by_channel_id(channel_id).messages.post(chat_message)
+        created = await _graph_call(client.teams.by_team_id(team_id).channels.by_channel_id(channel_id).messages.post(chat_message), "Graph API call")
+        _cache_invalidate("read:relevant_people")
 
         return {
             "status": "sent",
@@ -1732,7 +1833,15 @@ async def send_channel_message(
             "content_type": content_type,
         }
     except Exception as e:
-        logger.error(f"Failed to send channel message: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "channel_message_send_failed",
+            "Failed to send channel message",
+            team_id=team_id,
+            channel_id=channel_id,
+            error=str(e),
+        )
         return {"error": f"Failed to send channel message: {str(e)}"}
 
 
@@ -1747,7 +1856,7 @@ async def get_teams_and_channels(client: GraphServiceClient) -> list[dict]:
         list[dict]: List of teams with their channels or empty list on error
     """
     try:
-        teams = await client.me.joined_teams.get()
+        teams = await _graph_call(client.me.joined_teams.get(), "Graph API call")
         results = []
         if teams and teams.value:
             for team in teams.value:
@@ -1757,7 +1866,7 @@ async def get_teams_and_channels(client: GraphServiceClient) -> list[dict]:
                     "channels": [],
                 }
                 if team.id:
-                    channels = await client.teams.by_team_id(team.id).channels.get()
+                    channels = await _graph_call(client.teams.by_team_id(team.id).channels.get(), "Graph API call")
                     if channels and channels.value:
                         for ch in channels.value:
                             team_info["channels"].append({
@@ -1786,7 +1895,7 @@ async def get_user_presence(client: GraphServiceClient, user_ids: Optional[list[
         results = []
         if user_ids:
             request_body = GetPresencesByUserIdPostRequestBody(ids=user_ids)
-            presences = await client.communications.get_presences_by_user_id.post(request_body)
+            presences = await _graph_call(client.communications.get_presences_by_user_id.post(request_body), "Graph API call")
             if presences and presences.value:
                 for p in presences.value:
                     results.append({
@@ -1795,7 +1904,7 @@ async def get_user_presence(client: GraphServiceClient, user_ids: Optional[list[
                         "activity": p.activity,
                     })
         else:
-            presence = await client.me.presence.get()
+            presence = await _graph_call(client.me.presence.get(), "Graph API call")
             if presence:
                 results.append({
                     "user_id": presence.id,
@@ -1822,13 +1931,18 @@ async def get_relevant_people(client: GraphServiceClient, top: int = 25) -> list
         list[dict]: List of relevant people or empty list on error
     """
     try:
+        cache_key = f"read:relevant_people:{top}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         query_params = PeopleRequestBuilder.PeopleRequestBuilderGetQueryParameters(
             top=top,
         )
         request_config = RequestConfiguration[PeopleRequestBuilder.PeopleRequestBuilderGetQueryParameters](
             query_parameters=query_params,
         )
-        people = await client.me.people.get(request_configuration=request_config)
+        people = await _graph_call(client.me.people.get(request_configuration=request_config), "Graph API call")
         results = []
         if people and people.value:
             for person in people.value:
@@ -1840,9 +1954,16 @@ async def get_relevant_people(client: GraphServiceClient, top: int = 25) -> list
                     "department": person.department,
                     "company": person.company_name,
                 })
-        return results
+        return _cache_set(cache_key, results)
     except Exception as e:
-        logger.error(f"Failed to get relevant people: {e}")
+        log_event(
+            logger,
+            logging.ERROR,
+            "relevant_people_fetch_failed",
+            "Failed to get relevant people",
+            top=top,
+            error=str(e),
+        )
         return [{"error": f"Failed to get relevant people: {str(e)}"}]
 
 
@@ -1858,7 +1979,7 @@ async def get_trending_files(client: GraphServiceClient, top: int = 25) -> list[
         list[dict]: List of trending files or empty list on error
     """
     try:
-        trending = await client.me.insights.trending.get()
+        trending = await _graph_call(client.me.insights.trending.get(), "Graph API call")
         results = []
         if trending and trending.value:
             for item in trending.value[:top]:
@@ -1887,7 +2008,12 @@ async def get_onenote_notebooks(client: GraphServiceClient) -> list[dict]:
         list[dict]: List of notebooks with sections or empty list on error
     """
     try:
-        notebooks = await client.me.onenote.notebooks.get()
+        cache_key = "read:onenote_notebooks"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        notebooks = await _graph_call(client.me.onenote.notebooks.get(), "Graph API call")
         results = []
         if notebooks and notebooks.value:
             for nb in notebooks.value:
@@ -1898,7 +2024,7 @@ async def get_onenote_notebooks(client: GraphServiceClient) -> list[dict]:
                     "sections": [],
                 }
                 if nb.id:
-                    sections = await client.me.onenote.notebooks.by_notebook_id(nb.id).sections.get()
+                    sections = await _graph_call(client.me.onenote.notebooks.by_notebook_id(nb.id).sections.get(), "Graph API call")
                     if sections and sections.value:
                         for s in sections.value:
                             nb_info["sections"].append({
@@ -1906,7 +2032,7 @@ async def get_onenote_notebooks(client: GraphServiceClient) -> list[dict]:
                                 "name": s.display_name,
                             })
                 results.append(nb_info)
-        return results
+        return _cache_set(cache_key, results)
     except Exception as e:
         logger.error(f"Failed to get onenote notebooks: {e}")
         return [{"error": f"Failed to get onenote notebooks: {str(e)}"}]
@@ -1931,7 +2057,7 @@ async def get_onenote_pages(client: GraphServiceClient, section_id: str, top: in
         request_config = RequestConfiguration[PagesRequestBuilder.PagesRequestBuilderGetQueryParameters](
             query_parameters=query_params,
         )
-        pages = await client.me.onenote.sections.by_onenote_section_id(section_id).pages.get(request_configuration=request_config)
+        pages = await _graph_call(client.me.onenote.sections.by_onenote_section_id(section_id).pages.get(request_configuration=request_config), "Graph API call")
         results = []
         if pages and pages.value:
             for page in pages.value:
@@ -1960,8 +2086,8 @@ async def get_onenote_page_content(client: GraphServiceClient, page_id: str) -> 
         dict: Page metadata/content or error
     """
     try:
-        page = await client.me.onenote.pages.by_onenote_page_id(page_id).get()
-        content_bytes = await client.me.onenote.pages.by_onenote_page_id(page_id).content.get()
+        page = await _graph_call(client.me.onenote.pages.by_onenote_page_id(page_id).get(), "Graph API call")
+        content_bytes = await _graph_call(client.me.onenote.pages.by_onenote_page_id(page_id).content.get(), "Graph API call")
 
         return {
             "page_id": page_id,
@@ -1991,9 +2117,11 @@ async def create_onenote_page(client: GraphServiceClient, section_id: str, title
         page.title = title
         page.content = content_html
 
-        created = await client.me.onenote.sections.by_onenote_section_id(section_id).pages.post(page)
+        created = await _graph_call(client.me.onenote.sections.by_onenote_section_id(section_id).pages.post(page), "Graph API call")
         if not created:
             return {"error": "Failed to create onenote page."}
+
+        _cache_invalidate("read:onenote_notebooks")
 
         web_url = created.links.one_note_web_url.href if created.links and created.links.one_note_web_url else None
 
@@ -2064,7 +2192,7 @@ async def get_daily_briefing(
                 continue
             if due_dt.date() == target_date:
                 due_today.append(task)
-            if due_dt.date() < target_date and task.get("status") != "completed":
+            if due_dt.date() < target_date and task.get("status") != TodoStatus.COMPLETED.value:
                 overdue.append(task)
 
         recent_files = await get_recent_files(client, top=5)
@@ -2113,7 +2241,7 @@ async def prepare_meeting_brief(
         dict: Meeting brief payload or error
     """
     try:
-        event = await client.me.events.by_event_id(event_id).get()
+        event = await _graph_call(client.me.events.by_event_id(event_id).get(), "Graph API call")
         if not event:
             return {"error": "Event not found."}
 
@@ -2184,7 +2312,7 @@ async def health_check(client: GraphServiceClient) -> dict:
     """
     checked_at = datetime.now(timezone.utc).isoformat()
     try:
-        profile = await client.me.get()
+        profile = await _graph_call(client.me.get(), "Graph API call")
         details = ["Successfully queried Microsoft Graph /me endpoint."]
         if profile and profile.id:
             details.append(f"Authenticated user id: {profile.id}")

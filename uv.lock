@@ -830,6 +830,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "microsoft-kiota-abstractions" },
     { name = "msgraph-sdk" },
+    { name = "pydantic" },
     { name = "python-dotenv" },
 ]
 
@@ -839,6 +840,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=3.1.0" },
     { name = "microsoft-kiota-abstractions", specifier = ">=1.9.9" },
     { name = "msgraph-sdk", specifier = ">=1.55.0" },
+    { name = "pydantic", specifier = ">=2.0,<3.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
 ]
 
