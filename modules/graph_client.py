@@ -18,21 +18,25 @@ ALL_SCOPES = [
     'Tasks.Read',
     'Tasks.ReadWrite',
     'Mail.Read',
+    'Mail.ReadWrite',
     'Mail.Send',
     'Calendars.Read',
     'Calendars.ReadWrite',
     'ThreatHunting.Read.All',
     'Contacts.Read',
     'Files.Read',
+    'Files.ReadWrite',
     'Files.Read.All',
     'Chat.Read',
     'Chat.ReadWrite',  # Required for sending Teams messages
+    'ChannelMessage.Send',
     'Channel.ReadBasic.All',
     'Group.Read.All',
     'Presence.Read.All',
     'People.Read',
     'Sites.Read.All',
     'Notes.Read',
+    'Notes.ReadWrite',
 ]
 
 
